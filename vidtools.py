@@ -3,33 +3,50 @@
 vidtool — 视频处理工具箱（依赖 ffmpeg / ffprobe）
 
 用法:
-  python vidtool.py                       交互式菜单（无参数运行）
+  python vidtool.py                       交互式菜单
   python vidtool.py <命令> [参数]          命令行模式
-  python vidtool.py --help                 查看所有命令
+  python vidtool.py --help                查看完整命令说明
 
-命令一览:
+通用选项:
+  --gpu             启用 GPU 硬件编码（convert / resize / compress 可用）
 
-  基础操作                      水印/叠加
-  ──────────                   ──────────
-  info        查看视频信息      watermark-text   文字水印（支持定位）
-  trim        裁剪片段          watermark-image  图片水印
-  convert     格式转换          watermark-tile   平铺文字水印（满屏防伪）
-  resize      调整分辨率
-  rotate      旋转画面          音频
-  speed       调整播放速度      ──────────
-  compress    压缩视频          extract-audio    提取音频
-  screenshot  截图              mute             去除音频
-  gif         生成 GIF          replace-audio    替换音频
-  thumbnail   均匀缩略图集      volume           音量调节 (dB)
-  thumbnail-grid  九宫格缩略图
+命令分类:
 
-  字幕                          其他
-  ──────────                   ──────────
-  subtitle-extract  提取字幕    crop             裁切画面
-  subtitle-burn     烧录硬字幕  fps              改变帧率
-  subtitle-add      添加软字幕  filter           自定义 ffmpeg 滤镜
-                               overlay-video    画中画叠加
-                               concat           视频拼接
+  基础操作
+    info              查看视频信息
+    trim              裁剪片段
+    convert           格式转换
+    resize            调整分辨率
+    rotate            旋转画面
+    speed             调整播放速度
+    compress          压缩视频
+    screenshot        截图
+    gif               生成 GIF
+    thumbnail         均匀缩略图集
+    thumbnail-grid    九宫格缩略图
+
+  水印 / 叠加
+    watermark-text    文字水印（支持定位）
+    watermark-image   图片水印
+    watermark-tile    平铺文字水印（满屏防伪）
+    overlay-video     画中画叠加
+
+  音频
+    extract-audio     提取音频
+    mute              去除音频
+    replace-audio     替换音频
+    volume            音量调节 (dB)
+
+  字幕
+    subtitle-extract  提取字幕
+    subtitle-burn     烧录硬字幕
+    subtitle-add      添加软字幕
+
+  其他
+    crop              裁切画面
+    fps               改变帧率
+    filter            自定义 ffmpeg 滤镜
+    concat            视频拼接
 """
 
 import argparse
@@ -130,6 +147,102 @@ TILE_DEFAULT_FONT_SIZE = 24         # 平铺水印默认字号
 TILE_DEFAULT_CELL_W = 200           # 平铺水印单元格宽度 px
 TILE_DEFAULT_CELL_H = 60            # 平铺水印单元格高度 px
 
+# GPU 硬件编码支持
+
+GPU_BACKENDS: dict = {}  # 缓存检测结果
+
+def _detect_gpu_backends() -> dict:
+    """扫描 ffmpeg -encoders，返回可用 GPU 后端列表。"""
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        capture_output=True, text=True, encoding="utf-8"
+    )
+    enc = result.stdout
+    backends: dict = {}
+    if "h264_nvenc" in enc:
+        backends["nvidia"] = ("h264_nvenc", "hevc_nvenc")
+    if "h264_amf" in enc:
+        backends["amd"] = ("h264_amf", "hevc_amf")
+    if "h264_qsv" in enc:
+        backends["intel"] = ("h264_qsv", "hevc_qsv")
+    if "h264_videotoolbox" in enc:
+        backends["apple"] = ("h264_videotoolbox", "hevc_videotoolbox")
+    return backends
+
+
+def get_gpu_backend(backend_hint: str | None = None) -> str | None:
+    """返回可用 backend 名称 (nvidia/amd/intel/apple)，按 hint 或自动检测。"""
+    global GPU_BACKENDS
+    if not GPU_BACKENDS:
+        GPU_BACKENDS = _detect_gpu_backends()
+    if not GPU_BACKENDS:
+        return None
+    if backend_hint:
+        return backend_hint if backend_hint in GPU_BACKENDS else None
+    return next(iter(GPU_BACKENDS))
+
+
+def gpu_encoder_args(backend: str, *, hevc: bool = False,
+                     crf: int = 23, preset: str = "fast") -> list[str]:
+    """返回替换软件编码器的 ffmpeg 参数列表。
+
+    注意各后端的参数差异:
+      - NVENC: -cq (非 -crf), preset p1-p7
+      - AMD:   -quality, -rc
+      - Intel: -global_quality
+      - Apple:  -q:v (1-100)
+    """
+    codec_map = {
+        "nvidia": ("h264_nvenc", "hevc_nvenc"),
+        "amd":    ("h264_amf", "hevc_amf"),
+        "intel":  ("h264_qsv", "hevc_qsv"),
+        "apple":  ("h264_videotoolbox", "hevc_videotoolbox"),
+    }
+    h264_codec, hevc_codec = codec_map.get(backend, ("libx264", "libx265"))
+    codec = hevc_codec if hevc else h264_codec
+    args: list[str] = ["-c:v", codec]
+
+    nvenc_presets = {
+        "ultrafast": "p1", "superfast": "p2", "veryfast": "p3",
+        "faster": "p4", "fast": "p4", "medium": "p5",
+        "slow": "p6", "slower": "p7", "veryslow": "p7",
+    }
+
+    if backend == "nvidia":
+        args += ["-cq", str(crf)]
+        args += ["-preset", nvenc_presets.get(preset, "p4")]
+        args += ["-rc", "vbr", "-b:v", "0"]
+    elif backend == "amd":
+        args += ["-quality", preset, "-rc", "cbr"]
+    elif backend == "intel":
+        args += ["-global_quality", str(crf)]
+    elif backend == "apple":
+        args += ["-quality", preset]
+        args += ["-q:v", str(max(1, min(100, int(100 - crf * 2))))]
+    else:
+        args = ["-c:v", "libx264", "-crf", str(crf), "-preset", preset]
+
+    return args
+
+
+def _video_encoder_args(args, *, crf_override: int | None = None,
+                        preset_override: str | None = None) -> list[str] | None:
+    """根据 --gpu 标志返回 GPU 编码参数，无 GPU 返回 None。
+
+    crf_override/preset_override 可覆盖命令默认值（例如 compress 用不同预设）。
+    """
+    if not args.gpu:
+        return None
+    hint = args.gpu if isinstance(args.gpu, str) else None
+    backend = get_gpu_backend(hint)
+    if not backend:
+        print("[警告] 未检测到 GPU 编码器，使用软件编码")
+        return None
+    crf_val = crf_override if crf_override is not None else int(getattr(args, 'crf', None) or ENCODE_CRF)
+    preset = preset_override if preset_override is not None else ENCODE_PRESET
+    return gpu_encoder_args(backend, crf=crf_val, preset=preset)
+
+
 # 1. 视频信息
 
 def cmd_info(args):
@@ -213,8 +326,12 @@ def cmd_convert(args):
         "-i", args.input,
     ]
     if args.format == "mp4":
-        cmd += ["-c:v", "libx264", "-crf", ENCODE_CRF, "-preset", ENCODE_PRESET,
-                "-c:a", "aac", "-b:a", AUDIO_BITRATE]
+        gpu_args = _video_encoder_args(args)
+        if gpu_args:
+            cmd += gpu_args
+        else:
+            cmd += ["-c:v", "libx264", "-crf", ENCODE_CRF, "-preset", ENCODE_PRESET]
+        cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE]
     elif args.format == "webm":
         cmd += ["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0",
                 "-c:a", "libopus", "-b:a", AUDIO_BITRATE]
@@ -244,10 +361,13 @@ def cmd_resize(args):
     else:
         scale = preset.get(size) or "1280:-2"
 
+    enc_args = _video_encoder_args(args) or [
+        "-c:v", "libx264", "-crf", ENCODE_CRF, "-preset", ENCODE_PRESET,
+    ]
     run([
         "ffmpeg", "-y", "-i", args.input,
         "-vf", f"scale={scale}",
-        "-c:v", "libx264", "-crf", ENCODE_CRF, "-preset", ENCODE_PRESET,
+        *enc_args,
         "-c:a", "copy",
         output,
     ], f"调整分辨率 -> {args.size}", verbose=args.verbose)
@@ -312,7 +432,7 @@ def cmd_extract_audio(args):
     print(f"已保存: {output}")
 
 
-# 8. 去除 / 替换音频
+# 8. 去除音频
 
 def cmd_mute(args):
     assert_input(args.input)
@@ -324,6 +444,7 @@ def cmd_mute(args):
     ], "去除音频", verbose=args.verbose)
     print(f"已保存: {output}")
 
+# 9. 替换音频
 
 def cmd_replace_audio(args):
     assert_input(args.input)
@@ -341,7 +462,7 @@ def cmd_replace_audio(args):
     print(f"已保存: {output}")
 
 
-# 9. 压缩视频
+# 10. 压缩视频
 
 def cmd_compress(args):
     assert_input(args.input)
@@ -357,22 +478,47 @@ def cmd_compress(args):
         audio_kbps  = 128
         video_kbps  = max(100, target_kbps - audio_kbps)
         print(f"   目标比特率: 视频 {video_kbps} kbps + 音频 {audio_kbps} kbps")
-        run(["ffmpeg", "-y", "-i", args.input,
-             "-c:v", "libx264", "-b:v", f"{video_kbps}k",
-             "-pass", "1", "-an", "-f", "null", os.devnull],
-            "两遍压缩 第1遍", verbose=args.verbose)
-        run(["ffmpeg", "-y", "-i", args.input,
-             "-c:v", "libx264", "-b:v", f"{video_kbps}k",
-             "-pass", "2", "-c:a", "aac", "-b:a", f"{audio_kbps}k",
-             output],
-            "两遍压缩 第2遍", verbose=args.verbose)
+
+        gpu_args = _video_encoder_args(args)
+        if gpu_args:
+            # GPU: 1-pass VBR，替换默认无限制 -b:v 0 为目标比特率
+            filtered: list[str] = []
+            skip = False
+            for item in gpu_args:
+                if skip:
+                    skip = False
+                    continue
+                if item == "-b:v":
+                    filtered += ["-b:v", f"{video_kbps}k"]
+                    skip = True  # 跳过后面的 "0"
+                else:
+                    filtered.append(item)
+            run(["ffmpeg", "-y", "-i", args.input] + filtered +
+                ["-c:a", "aac", "-b:a", f"{audio_kbps}k", output],
+                "GPU 压缩 (1-pass)", verbose=args.verbose)
+        else:
+            run(["ffmpeg", "-y", "-i", args.input,
+                 "-c:v", "libx264", "-b:v", f"{video_kbps}k",
+                 "-pass", "1", "-an", "-f", "null", os.devnull],
+                "两遍压缩 第1遍", verbose=args.verbose)
+            run(["ffmpeg", "-y", "-i", args.input,
+                 "-c:v", "libx264", "-b:v", f"{video_kbps}k",
+                 "-pass", "2", "-c:a", "aac", "-b:a", f"{audio_kbps}k",
+                 output],
+                "两遍压缩 第2遍", verbose=args.verbose)
     else:
-        crf = args.crf or COMPRESS_CRF
-        run(["ffmpeg", "-y", "-i", args.input,
-             "-c:v", "libx264", "-crf", str(crf), "-preset", "slow",
-             "-c:a", "aac", "-b:a", AUDIO_BITRATE,
-             output],
-            f"CRF={crf} 压缩", verbose=args.verbose)
+        crf_val = args.crf or COMPRESS_CRF
+        gpu_args = _video_encoder_args(args, crf_override=crf_val, preset_override="slow")
+        if gpu_args:
+            run(["ffmpeg", "-y", "-i", args.input] + gpu_args +
+                ["-c:a", "aac", "-b:a", AUDIO_BITRATE, output],
+                f"GPU CRF={crf_val} 压缩", verbose=args.verbose)
+        else:
+            run(["ffmpeg", "-y", "-i", args.input,
+                 "-c:v", "libx264", "-crf", str(crf_val), "-preset", "slow",
+                 "-c:a", "aac", "-b:a", AUDIO_BITRATE,
+                 output],
+                f"CRF={crf_val} 压缩", verbose=args.verbose)
 
     orig = Path(args.input).stat().st_size / 1_048_576
     comp = Path(output).stat().st_size / 1_048_576
@@ -380,7 +526,7 @@ def cmd_compress(args):
     print(f"   {orig:.2f} MB -> {comp:.2f} MB  (压缩率 {(1-comp/orig)*100:.1f}%)")
 
 
-# 10. 截图 / 缩略图 / 九宫格
+# 11. 截图
 
 def get_duration(path: str) -> str:
     result = subprocess.run(
@@ -404,6 +550,7 @@ def cmd_screenshot(args):
     ], f"截图时间点 {args.time}", verbose=args.verbose)
     print(f"已保存: {output}")
 
+# 12. 缩略图
 
 def cmd_thumbnail(args):
     """均匀抽帧生成 N 张缩略图。"""
@@ -420,6 +567,7 @@ def cmd_thumbnail(args):
     ], f"生成 {count} 张缩略图", verbose=args.verbose)
     print(f"缩略图已保存至: {out_dir}/")
 
+# 13. 九宫格拼图
 
 def cmd_thumbnail_grid(args):
     """九宫格式缩略图拼图（例如 3x3）"""
@@ -440,7 +588,7 @@ def cmd_thumbnail_grid(args):
     print(f"拼图已保存: {output}")
 
 
-# 11. 转 GIF
+# 14. 转 GIF
 
 def _to_gif(input_path, output, fps=GIF_DEFAULT_FPS, width=GIF_DEFAULT_WIDTH, start=None, duration=None):
     palette = os.path.join(tempfile.gettempdir(), "_vidtool_palette.png")
@@ -485,7 +633,7 @@ def cmd_gif(args):
     print(f"已保存: {output}  ({size:.0f} KB)")
 
 
-# 12. 水印
+# 15. 文字水印
 
 POSITION_MAP = {
     "topleft":     "10:10",
@@ -516,6 +664,7 @@ def cmd_watermark_text(args):
         "添加文字水印", verbose=args.verbose)
     print(f"已保存: {output}")
 
+# 16. 图片水印
 
 def cmd_watermark_image(args):
     assert_input(args.input)
@@ -534,6 +683,7 @@ def cmd_watermark_image(args):
     ], "添加图片水印", verbose=args.verbose)
     print(f"已保存: {output}")
 
+# 17. 平铺水印
 
 def cmd_watermark_tile(args):
     assert_input(args.input)
@@ -571,10 +721,7 @@ def cmd_watermark_tile(args):
     ], "平铺水印", verbose=args.verbose)
     print(f"已保存: {output}")
 
-
-# 新增功能
-
-# --- 音量调节 ---
+# 18. 音量调节
 def cmd_volume(args):
     assert_input(args.input)
     output = args.output or default_output(args.input, f"_vol{args.db}dB")
@@ -588,7 +735,7 @@ def cmd_volume(args):
     print(f"已保存: {output}")
 
 
-# --- 画面裁剪 ---
+# 19. 画面裁剪
 def cmd_crop(args):
     assert_input(args.input)
     output = args.output or default_output(args.input, "_cropped")
@@ -602,7 +749,7 @@ def cmd_crop(args):
     print(f"已保存: {output}")
 
 
-# --- 改变帧率（不改变速度） ---
+# 20. 改变帧率（不改变速度）
 def cmd_fps(args):
     assert_input(args.input)
     output = args.output or default_output(args.input, f"_fps{args.rate}")
@@ -615,7 +762,7 @@ def cmd_fps(args):
     print(f"已保存: {output}")
 
 
-# --- 通用视频滤镜（亮度、模糊、调色等） ---
+# 21. 通用视频滤镜（亮度、模糊、调色等）
 def cmd_filter(args):
     assert_input(args.input)
     output = args.output or default_output(args.input, "_filtered")
@@ -628,7 +775,7 @@ def cmd_filter(args):
     print(f"已保存: {output}")
 
 
-# --- 字幕提取 ---
+# 22. 字幕提取
 def cmd_subtitle_extract(args):
     assert_input(args.input)
     output = args.output or default_output(args.input, "_sub", f".{args.format or 'srt'}")
@@ -640,7 +787,7 @@ def cmd_subtitle_extract(args):
     print(f"已保存: {output}")
 
 
-# --- 烧录硬字幕 ---
+# 23. 烧录硬字幕
 def cmd_subtitle_burn(args):
     assert_input(args.input)
     assert_input(args.sub_file)
@@ -656,7 +803,7 @@ def cmd_subtitle_burn(args):
     print(f"已保存: {output}")
 
 
-# --- 添加外挂软字幕 ---
+# 24. 添加外挂软字幕
 def cmd_subtitle_add(args):
     assert_input(args.input)
     assert_input(args.sub_file)
@@ -675,7 +822,7 @@ def cmd_subtitle_add(args):
     print(f"已保存: {output}")
 
 
-# --- 画中画（叠加另一个视频） ---
+# 25. 画中画（叠加另一个视频）
 def cmd_overlay_video(args):
     assert_input(args.input)
     assert_input(args.overlay)
@@ -693,7 +840,7 @@ def cmd_overlay_video(args):
     print(f"已保存: {output}")
 
 
-# --- 视频拼接（多文件） ---
+# 26. 视频拼接（多文件）
 def cmd_concat(args):
     inputs = args.files
     for f in inputs:
@@ -770,12 +917,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("convert", help="格式转换")
     sp.add_argument("input");  sp.add_argument("-f", "--format", default="mp4",
         choices=["mp4", "mkv", "webm", "avi", "mov", "gif"], help="目标格式")
+    sp.add_argument("--gpu", nargs="?", const=True, default=False,
+        help="使用 GPU 硬件编码 (nvidia/amd/intel/apple，留空自动检测)")
     sp.add_argument("-o", "--output")
 
     # resize
     sp = sub.add_parser("resize", help="调整分辨率")
     sp.add_argument("input");  sp.add_argument("--size", default="720p",
         help="720p / 1080p / 4k / 宽:高，例: 1280:720")
+    sp.add_argument("--gpu", nargs="?", const=True, default=False,
+        help="使用 GPU 硬件编码 (nvidia/amd/intel/apple，留空自动检测)")
     sp.add_argument("-o", "--output")
 
     # rotate
@@ -811,6 +962,8 @@ def build_parser() -> argparse.ArgumentParser:
     g = sp.add_mutually_exclusive_group()
     g.add_argument("--target-mb", type=float, help="目标文件大小（MB），使用两遍编码")
     g.add_argument("--crf", type=int, help="CRF 值（18~35，越大越小）")
+    sp.add_argument("--gpu", nargs="?", const=True, default=False,
+        help="使用 GPU 硬件编码 (nvidia/amd/intel/apple，留空自动检测)")
     sp.add_argument("-o", "--output")
 
     # screenshot
@@ -992,6 +1145,7 @@ class _InteractiveArgs:
     columns: int = THUMB_DEFAULT_COLS
     rows: int = THUMB_DEFAULT_ROWS
     files: list[str] | None = None
+    gpu: bool | str = False
 
 
 def main():
@@ -1074,9 +1228,13 @@ def interactive_mode():
             cmd_trim(args)
         elif cmd == "convert":
             args.format = input("目标格式 (mp4/webm/mkv/mov/avi/gif): ").strip().lower()
+            if input("使用 GPU 加速？(y/N): ").strip().lower() == "y":
+                args.gpu = True
             cmd_convert(args)
         elif cmd == "resize":
             args.size = input("分辨率 (720p/1080p/4k 或 1280:720): ").strip()
+            if input("使用 GPU 加速？(y/N): ").strip().lower() == "y":
+                args.gpu = True
             cmd_resize(args)
         elif cmd == "rotate":
             deg = input("旋转角度 (90/180/270): ").strip()
@@ -1098,6 +1256,8 @@ def interactive_mode():
             else:
                 args.crf = int(input(f"CRF值(18-35, 默认{COMPRESS_CRF}): ").strip() or str(COMPRESS_CRF))
                 args.target_mb = None
+            if input("使用 GPU 加速？(y/N): ").strip().lower() == "y":
+                args.gpu = True
             cmd_compress(args)
         elif cmd == "screenshot":
             args.time = input("截图时间点 (如 00:01:23): ").strip() or "00:00:01"
