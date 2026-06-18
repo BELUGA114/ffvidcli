@@ -118,10 +118,19 @@ def default_output(input_path: str, suffix: str, ext: str | None = None) -> str:
 
 def hms_to_sec(t: str) -> float:
     """HH:MM:SS.ms 或纯秒数 → float 秒"""
+    t = t.strip()
+    if not t:
+        return 0.0
     if ":" in t:
         parts = t.split(":")
-        return sum(float(v) * 60 ** i for i, v in enumerate(reversed(parts)))
-    return float(t)
+        try:
+            return sum(float(v) * 60 ** i for i, v in enumerate(reversed(parts)))
+        except ValueError:
+            sys.exit(f"[错误] 无法解析时间: {t}")
+    try:
+        return float(t)
+    except ValueError:
+        sys.exit(f"[错误] 无法解析时间: {t}")
 
 
 # 可调默认值 — 改此处一处，全局生效
@@ -141,7 +150,29 @@ EXT_AUDIO_BITRATE = "192k"      # 提取音频比特率
 ENCODE_CRF = "23"               # 编码默认 CRF（转换 / 缩放）
 COMPRESS_CRF = 28               # 压缩默认 CRF
 ENCODE_PRESET = "fast"          # 默认编码 preset
-FONT_FILE = "C:/Windows/Fonts/arial.ttf"  # drawtext 字体文件（Windows 必须显式指定）
+def _detect_default_font() -> str:
+    """跨平台检测可用字体，供 drawtext 滤镜使用。"""
+    candidates = [
+        # Windows
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/msyh.ttc",
+        # macOS
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Arial.ttf",
+        # Linux
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    # 最后回退：假设系统有 Arial
+    return "Arial"
+
+
+FONT_FILE = _detect_default_font()  # drawtext 字体文件（ffmpeg Windows 需显式指定路径）
 TILE_DEFAULT_COLOR = "white@0.15"   # 平铺水印默认颜色
 TILE_DEFAULT_FONT_SIZE = 24         # 平铺水印默认字号
 TILE_DEFAULT_CELL_W = 200           # 平铺水印单元格宽度 px
@@ -308,7 +339,8 @@ def cmd_trim(args):
         cmd += ["-t", str(dur)]
     cmd += ["-i", args.input]
     if args.accurate:
-        cmd += ["-c:v", "libx264", "-c:a", "aac"]
+        cmd += ["-c:v", "libx264", "-crf", ENCODE_CRF, "-preset", ENCODE_PRESET,
+                "-c:a", "aac", "-b:a", AUDIO_BITRATE]
     else:
         cmd += ["-c", "copy"]
     cmd.append(output)
@@ -336,7 +368,10 @@ def cmd_convert(args):
         cmd += ["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0",
                 "-c:a", "libopus", "-b:a", AUDIO_BITRATE]
     elif args.format == "gif":
-        return _to_gif(args.input, output, fps=GIF_DEFAULT_FPS, width=GIF_DEFAULT_WIDTH)
+        _to_gif(args.input, output, fps=GIF_DEFAULT_FPS, width=GIF_DEFAULT_WIDTH)
+        size = Path(output).stat().st_size / 1024
+        print(f"已保存: {output}  ({size:.0f} KB)")
+        return
     else:
         cmd += ["-c", "copy"]
     cmd.append(output)
@@ -378,9 +413,11 @@ def cmd_resize(args):
 
 def cmd_rotate(args):
     assert_input(args.input)
+    if args.degrees not in (90, 180, 270):
+        sys.exit(f"[错误] 旋转角度仅支持 90/180/270，收到: {args.degrees}")
     output = args.output or default_output(args.input, f"_rot{args.degrees}")
     transpose_map = {"90": "1", "180": "2,transpose=2", "270": "2"}
-    vf = f"transpose={transpose_map.get(str(args.degrees), '1')}"
+    vf = f"transpose={transpose_map[str(args.degrees)]}"
     run([
         "ffmpeg", "-y", "-i", args.input,
         "-vf", vf, "-c:a", "copy",
@@ -394,6 +431,8 @@ def cmd_rotate(args):
 def cmd_speed(args):
     assert_input(args.input)
     factor = args.factor
+    if factor <= 0:
+        sys.exit("[错误] 速度倍率必须大于 0")
     output = args.output or default_output(args.input, f"_x{factor}")
 
     video_filter = f"setpts={1/factor:.4f}*PTS"
@@ -409,6 +448,8 @@ def cmd_speed(args):
         "-filter_complex",
         f"[0:v]{video_filter}[v];[0:a]{audio_filter}[a]",
         "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-crf", ENCODE_CRF, "-preset", ENCODE_PRESET,
+        "-c:a", "aac", "-b:a", AUDIO_BITRATE,
         output,
     ], f"速度调整 x {factor}", verbose=args.verbose)
     print(f"已保存: {output}")
@@ -469,21 +510,21 @@ def cmd_compress(args):
     output = args.output or default_output(args.input, "_compressed")
 
     if args.target_mb:
-        duration = float(subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", args.input],
-            capture_output=True, text=True,
-        ).stdout.strip())
+        duration_str = get_duration(args.input)
+        if not duration_str or float(duration_str) <= 0:
+            sys.exit("[错误] 无法获取视频时长，无法按目标大小压缩")
+        duration = float(duration_str)
         target_kbps = int((args.target_mb * 8 * 1024) / duration)
         audio_kbps  = 128
         video_kbps  = max(100, target_kbps - audio_kbps)
-        print(f"   目标比特率: 视频 {video_kbps} kbps + 音频 {audio_kbps} kbps")
+        print(f"   时长: {duration:.1f}s  目标比特率: 视频 {video_kbps} kbps + 音频 {audio_kbps} kbps")
 
         gpu_args = _video_encoder_args(args)
         if gpu_args:
-            # GPU: 1-pass VBR，替换默认无限制 -b:v 0 为目标比特率
+            # GPU 1-pass VBR；非 NVIDIA 后端可能不支持 -b:v，此时退回到 CRF 模式
             filtered: list[str] = []
             skip = False
+            has_bv = any(a == "-b:v" for a in gpu_args)
             for item in gpu_args:
                 if skip:
                     skip = False
@@ -493,6 +534,9 @@ def cmd_compress(args):
                     skip = True  # 跳过后面的 "0"
                 else:
                     filtered.append(item)
+            if not has_bv:
+                print(f"   [警告] 当前 GPU 后端不支持按比特率编码，使用限制 CRF={ENCODE_CRF} 模式")
+                filtered += ["-crf", ENCODE_CRF]
             run(["ffmpeg", "-y", "-i", args.input] + filtered +
                 ["-c:a", "aac", "-b:a", f"{audio_kbps}k", output],
                 "GPU 压缩 (1-pass)", verbose=args.verbose)
@@ -591,36 +635,49 @@ def cmd_thumbnail_grid(args):
 # 14. 转 GIF
 
 def _to_gif(input_path, output, fps=GIF_DEFAULT_FPS, width=GIF_DEFAULT_WIDTH, start=None, duration=None):
-    palette = os.path.join(tempfile.gettempdir(), "_vidtool_palette.png")
     ss_args = (["-ss", start] if start else [])
     t_args  = (["-t", duration] if duration else [])
     scale   = f"scale={width}:-2:flags=lanczos"
 
-    run(
-        ["ffmpeg", "-y"] + ss_args + t_args +
-        ["-i", input_path,
-         "-vf", f"{scale},palettegen",
-         palette],
-        "生成 GIF 调色板",
-    )
-    run(
-        ["ffmpeg", "-y"] + ss_args + t_args +
-        ["-i", input_path, "-i", palette,
-         "-filter_complex",
-         f"{scale}[x];[x][1:v]paletteuse",
-         "-r", str(fps),
-         output],
-        "渲染 GIF",
-    )
+    # 用 tempfile 创建调色板，确保异常退出时也能清理
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        palette = f.name
     try:
-        os.unlink(palette)
-    except OSError:
-        pass
+        run(
+            ["ffmpeg", "-y"] + ss_args + t_args +
+            ["-i", input_path,
+             "-vf", f"{scale},palettegen",
+             palette],
+            "生成 GIF 调色板",
+        )
+        run(
+            ["ffmpeg", "-y"] + ss_args + t_args +
+            ["-i", input_path, "-i", palette,
+             "-filter_complex",
+             f"{scale}[x];[x][1:v]paletteuse",
+             "-r", str(fps),
+             output],
+            "渲染 GIF",
+        )
+    finally:
+        try:
+            os.unlink(palette)
+        except OSError:
+            pass
     return output
 
 
 def cmd_gif(args):
     assert_input(args.input)
+    # 全视频转 GIF 可能耗时巨大且文件巨大，提醒用户
+    if not args.start and not args.duration:
+        dur = float(get_duration(args.input))
+        if dur > 30:
+            print(f"[警告] 视频时长 {dur:.0f}s，全量转 GIF 可能耗时较长且文件很大。")
+            print("       建议用 -s 和 --duration 指定片段。")
+            if input("继续转换？(y/N): ").strip().lower() != "y":
+                print("已取消")
+                return
     output = args.output or default_output(args.input, "_animated", ".gif")
     _to_gif(
         args.input, output,
@@ -756,7 +813,8 @@ def cmd_fps(args):
     run([
         "ffmpeg", "-y", "-i", args.input,
         "-r", str(args.rate),
-        "-c:v", "libx264", "-c:a", "copy",
+        "-c:v", "libx264", "-crf", ENCODE_CRF, "-preset", ENCODE_PRESET,
+        "-c:a", "copy",
         output,
     ], f"帧率调整为 {args.rate} fps", verbose=args.verbose)
     print(f"已保存: {output}")
@@ -851,15 +909,20 @@ def cmd_concat(args):
         list_file = f.name
 
     output = args.output or default_output(inputs[0], "_concat")
-    run([
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_file,
-        "-c", "copy",
-        output,
-    ], f"拼接 {len(inputs)} 个文件", verbose=args.verbose)
-    os.unlink(list_file)
+    try:
+        run([
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c", "copy",
+            output,
+        ], f"拼接 {len(inputs)} 个文件", verbose=args.verbose)
+    finally:
+        try:
+            os.unlink(list_file)
+        except OSError:
+            pass
     print(f"已保存: {output}")
 
 
@@ -900,6 +963,9 @@ def build_parser() -> argparse.ArgumentParser:
   python vidtool.py concat 1.mp4 2.mp4 3.mp4 -o merged.mp4
 """,
     )
+    p.add_argument("-V", "--version", action="version", version="vidtool 1.0")
+    p.add_argument("--verbose", action="store_true", default=False,
+                   help="显示 ffmpeg 实时编码进度（需放在子命令前）")
     sub = p.add_subparsers(dest="command", metavar="<命令>")
 
     # info
@@ -1211,6 +1277,7 @@ def interactive_mode():
             break
 
         args = _InteractiveArgs()
+        args.verbose = True  # 交互模式默认显示编码进度
         val = clean_path(input("输入视频文件路径: "))
         args.input = val
         if not args.input or not Path(args.input).is_file():
@@ -1241,7 +1308,15 @@ def interactive_mode():
             args.degrees = int(deg) if deg.isdigit() else 90
             cmd_rotate(args)
         elif cmd == "speed":
-            args.factor = float(input("速度倍数 (0.5=半速, 2.0=两倍): ").strip() or "1")
+            speed_str = input("速度倍数 (0.5=半速, 2.0=两倍): ").strip() or "1"
+            try:
+                args.factor = float(speed_str)
+            except ValueError:
+                print("请输入有效数字")
+                continue
+            if args.factor <= 0:
+                print("速度倍率必须大于 0")
+                continue
             cmd_speed(args)
         elif cmd == "extract-audio":
             args.format = input("音频格式 (mp3/aac/flac/wav/opus): ").strip().lower() or "mp3"
@@ -1251,10 +1326,20 @@ def interactive_mode():
         elif cmd == "compress":
             method = input("按目标大小(mb) 还是 画质(crf)？输入 mb/crf: ").strip().lower()
             if method == "mb":
-                args.target_mb = float(input("目标大小(MB): ").strip())
+                mb_str = input("目标大小(MB): ").strip()
+                try:
+                    args.target_mb = float(mb_str)
+                except ValueError:
+                    print("请输入有效数字")
+                    continue
                 args.crf = None
             else:
-                args.crf = int(input(f"CRF值(18-35, 默认{COMPRESS_CRF}): ").strip() or str(COMPRESS_CRF))
+                crf_str = input(f"CRF值(18-35, 默认{COMPRESS_CRF}): ").strip() or str(COMPRESS_CRF)
+                try:
+                    args.crf = int(crf_str)
+                except ValueError:
+                    print("请输入有效整数")
+                    continue
                 args.target_mb = None
             if input("使用 GPU 加速？(y/N): ").strip().lower() == "y":
                 args.gpu = True
@@ -1263,16 +1348,30 @@ def interactive_mode():
             args.time = input("截图时间点 (如 00:01:23): ").strip() or "00:00:01"
             cmd_screenshot(args)
         elif cmd == "thumbnail":
-            args.count = int(input(f"缩略图数量 (默认{THUMB_DEFAULT_COUNT}): ").strip() or str(THUMB_DEFAULT_COUNT))
+            count_str = input(f"缩略图数量 (默认{THUMB_DEFAULT_COUNT}): ").strip() or str(THUMB_DEFAULT_COUNT)
+            try:
+                args.count = int(count_str)
+            except ValueError:
+                print("请输入有效整数")
+                continue
             cmd_thumbnail(args)
         elif cmd == "gif":
             args.start = input("起始时间 (可选): ").strip() or None
             args.duration = input("持续秒数 (可选): ").strip() or None
-            args.fps = int(input(f"帧率 (默认{GIF_DEFAULT_FPS}): ").strip() or str(GIF_DEFAULT_FPS))
-            args.width = int(input(f"宽度 (默认{GIF_DEFAULT_WIDTH}): ").strip() or str(GIF_DEFAULT_WIDTH))
+            fps_str = input(f"帧率 (默认{GIF_DEFAULT_FPS}): ").strip() or str(GIF_DEFAULT_FPS)
+            width_str = input(f"宽度 (默认{GIF_DEFAULT_WIDTH}): ").strip() or str(GIF_DEFAULT_WIDTH)
+            try:
+                args.fps = int(fps_str)
+                args.width = int(width_str)
+            except ValueError:
+                print("请输入有效整数")
+                continue
             cmd_gif(args)
         elif cmd == "watermark-text":
             args.text = input("水印文字: ").strip()
+            if not args.text:
+                print("水印文字不能为空")
+                continue
             args.position = input(f"位置 (topleft/topright/bottomleft/bottomright/center, 默认{WM_DEFAULT_POSITION}): ").strip() or WM_DEFAULT_POSITION
             args.color = input(f"颜色 (默认{WM_DEFAULT_COLOR}): ").strip() or WM_DEFAULT_COLOR
             args.size = int(input(f"字号 (默认{WM_DEFAULT_FONT_SIZE}): ").strip() or str(WM_DEFAULT_FONT_SIZE))
@@ -1285,6 +1384,9 @@ def interactive_mode():
             cmd_watermark_image(args)
         elif cmd == "watermark-tile":
             args.text = input("水印文字: ").strip()
+            if not args.text:
+                print("水印文字不能为空")
+                continue
             args.color = input(f"颜色 (默认{TILE_DEFAULT_COLOR}): ").strip() or TILE_DEFAULT_COLOR
             args.size = int(input(f"字号 (默认{TILE_DEFAULT_FONT_SIZE}): ").strip() or str(TILE_DEFAULT_FONT_SIZE))
             args.font = input(f"字体路径 (默认{FONT_FILE}): ").strip() or FONT_FILE
@@ -1306,14 +1408,25 @@ def interactive_mode():
             cmd_thumbnail_grid(args)
         elif cmd == "volume":
             db_str = input("分贝值 (如 -10 减半, +6 翻倍): ").strip()
-            args.db = float(db_str) if db_str else 0.0
+            try:
+                args.db = float(db_str) if db_str else 0.0
+            except ValueError:
+                print("请输入有效数字")
+                continue
             cmd_volume(args)
         elif cmd == "crop":
             args.geometry = input("裁切参数 w:h:x:y (如 640:480:0:0): ").strip() or "640:480:0:0"
             cmd_crop(args)
         elif cmd == "fps":
             rate_str = input("目标帧率 (如 24): ").strip()
-            args.rate = float(rate_str) if rate_str else 24.0
+            try:
+                args.rate = float(rate_str) if rate_str else 24.0
+            except ValueError:
+                print("请输入有效数字")
+                continue
+            if args.rate <= 0:
+                print("帧率必须大于 0")
+                continue
             cmd_fps(args)
         elif cmd == "filter":
             args.filter_string = input("滤镜字符串 (如 eq=brightness=0.05): ").strip()
