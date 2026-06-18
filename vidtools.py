@@ -62,26 +62,55 @@ from pathlib import Path
 
 # 工具函数（增强：进度输出、更完善的出错处理）
 
-def run(cmd: list[str], desc: str = "", verbose: bool = False) -> subprocess.CompletedProcess:
-    """执行命令，可选择显示实时进度。"""
+def run(cmd: list[str], desc: str = "", verbose: bool = False,
+        output: str | None = None, duration: float | None = None
+        ) -> subprocess.CompletedProcess:
+    """执行 ffmpeg 命令，支持覆盖确认、进度显示、ETA 估算。"""
     if desc:
         print(f"  {desc}")
     print(f"   $ {shlex.join(str(c) for c in cmd)}\n")
 
+    # 自动检测输出文件（cmd 最后一个非 flag 参数），回退覆盖明确传入的 output
+    if output is None and cmd:
+        last = str(cmd[-1])
+        if last != os.devnull and not last.startswith('-') and '%' not in last:
+            output = last
+
+    # 覆盖保护：检查输出文件是否已存在
+    if output and Path(output).exists():
+        ans = input(f"  文件已存在: {output}\n  覆盖？(y/N): ").strip().lower()
+        if ans != 'y':
+            sys.exit("已取消")
+
     if verbose:
-        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
+        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1,
+                                encoding="utf-8", errors="replace")
         assert proc.stderr is not None
+        import re as _re
+        _time_re = _re.compile(r"time=(\d+):(\d+):(\d+\.?\d*)")
         for line in proc.stderr:
+            line = line.rstrip()
             if "frame=" in line or "time=" in line:
-                print(f"   {line.strip()}", end="\r")
+                if duration:
+                    m = _time_re.search(line)
+                    if m:
+                        elapsed = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                        pct = min(99.9, elapsed / duration * 100) if duration > 0 else 0
+                        remain = max(0, duration - elapsed)
+                        print(f"   {line}  [{pct:5.1f}%  ETA {remain:.0f}s]", end="\r")
+                    else:
+                        print(f"   {line}", end="\r")
+                else:
+                    print(f"   {line}", end="\r")
             else:
-                print(f"   {line.strip()}")
+                print(f"   {line}")
         proc.wait()
         if proc.returncode != 0:
             sys.exit(f"[错误] ffmpeg 退出码 {proc.returncode}")
         return subprocess.CompletedProcess(cmd, proc.returncode, "", "")
     else:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
         if result.returncode != 0:
             print(f"[错误] ffmpeg 退出码 {result.returncode}")
             print(result.stderr[-2000:])
@@ -93,6 +122,37 @@ def check_ffmpeg():
     for tool in ("ffmpeg", "ffprobe"):
         if shutil.which(tool) is None:
             sys.exit(f"[错误] 未找到 {tool}，请先安装 ffmpeg。")
+
+
+def preview_file(path: str) -> None:
+    """快速预览视频关键信息（分辨率、时长、编码、大小）。"""
+    result = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json",
+         "-show_format", "-show_streams", path],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if result.returncode != 0:
+        return
+    data = json.loads(result.stdout)
+    fmt = data.get("format", {})
+    streams = data.get("streams", [])
+
+    size_mb = int(fmt.get("size", 0)) / 1_048_576
+    dur_s = float(fmt.get("duration", 0))
+    dur_str = f"{int(dur_s // 3600)}:{int(dur_s % 3600 // 60):02d}:{int(dur_s % 60):02d}"
+    vinfo, ainfo = "", ""
+    for s in streams:
+        if s.get("codec_type") == "video":
+            vinfo = f"{s.get('width','?')}x{s.get('height','?')}  {s.get('codec_name','?')}"
+        elif s.get("codec_type") == "audio":
+            ainfo = f"{s.get('codec_name','?')}  {s.get('channels','?')}ch"
+    print(f"  ── {Path(path).name} ──")
+    if vinfo:
+        print(f"  视频: {vinfo}")
+    if ainfo:
+        print(f"  音频: {ainfo}")
+    print(f"  时长: {dur_str} ({dur_s:.0f}s)   大小: {size_mb:.1f} MB")
+    print()
 
 
 def clean_path(raw: str) -> str:
@@ -330,6 +390,14 @@ def cmd_info(args):
 def cmd_trim(args):
     assert_input(args.input)
     output = args.output or default_output(args.input, "_trimmed")
+
+    # 输出扩展名与输入不同且未启用精确裁剪 → 自动重编码（-c copy 跨容器会失败）
+    input_ext = Path(args.input).suffix.lower()
+    output_ext = Path(output).suffix.lower()
+    if not args.accurate and input_ext != output_ext:
+        print(f"  检测到容器格式变化 ({input_ext} → {output_ext})，自动切换为重编码模式")
+        args.accurate = True
+
     cmd = [
         "ffmpeg", "-y",
         "-ss", args.start,
@@ -344,7 +412,9 @@ def cmd_trim(args):
     else:
         cmd += ["-c", "copy"]
     cmd.append(output)
-    run(cmd, f"裁剪 {args.start} -> {args.end or '结尾'}", verbose=args.verbose)
+    dur_val = float(get_duration(args.input))
+    run(cmd, f"裁剪 {args.start} -> {args.end or '结尾'}", verbose=args.verbose,
+        output=output, duration=dur_val)
     print(f"已保存: {output}")
 
 
@@ -375,7 +445,9 @@ def cmd_convert(args):
     else:
         cmd += ["-c", "copy"]
     cmd.append(output)
-    run(cmd, f"转换为 {args.format.upper()}", verbose=args.verbose)
+    dur_val = float(get_duration(args.input))
+    run(cmd, f"转换为 {args.format.upper()}", verbose=args.verbose,
+        output=output, duration=dur_val)
     print(f"已保存: {output}")
 
 
@@ -386,11 +458,16 @@ def cmd_resize(args):
     output = args.output or default_output(args.input, f"_{args.size}")
 
     preset = {
-        "4k": "3840:-2", "2k": "2560:-2",
+        "4k": "3840:-2", "2160p": "3840:-2",
+        "2k": "2560:-2", "1440p": "2560:-2",
         "1080p": "1920:-2", "720p": "1280:-2",
         "480p": "854:-2",  "360p": "640:-2",
     }
-    size = args.size.lower().replace("x", ":")
+    # 规范化用户输入: "720"→"720p", "1280 720"→"1280:720", "1280x720"→"1280:720"
+    size = args.size.lower().strip().replace("x", ":").replace(" ", ":")
+    # 纯数字且无冒号 → 补 p
+    if size.isdigit():
+        size = size + "p"
     if ":" in size:
         scale = size
     else:
@@ -405,7 +482,7 @@ def cmd_resize(args):
         *enc_args,
         "-c:a", "copy",
         output,
-    ], f"调整分辨率 -> {args.size}", verbose=args.verbose)
+    ], f"调整分辨率 -> {args.size}", verbose=args.verbose, output=output)
     print(f"已保存: {output}")
 
 
@@ -909,13 +986,24 @@ def cmd_concat(args):
         list_file = f.name
 
     output = args.output or default_output(inputs[0], "_concat")
+
+    # 输出容器格式与输入不同 → 不能 -c copy，需重编码
+    input_ext = Path(inputs[0]).suffix.lower()
+    output_ext = Path(output).suffix.lower()
+    if input_ext != output_ext:
+        print(f"  检测到容器格式变化 ({input_ext} → {output_ext})，切换为重编码模式")
+        codec_args = ["-c:v", "libx264", "-crf", ENCODE_CRF, "-preset", ENCODE_PRESET,
+                      "-c:a", "aac", "-b:a", AUDIO_BITRATE]
+    else:
+        codec_args = ["-c", "copy"]
+
     try:
         run([
             "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", list_file,
-            "-c", "copy",
+            *codec_args,
             output,
         ], f"拼接 {len(inputs)} 个文件", verbose=args.verbose)
     finally:
@@ -1283,7 +1371,15 @@ def interactive_mode():
         if not args.input or not Path(args.input).is_file():
             print("文件不存在，重新选择")
             continue
+
+        # 快速预览文件信息，帮助用户做决策
+        preview_file(args.input)
         out = input("输出文件 (直接回车使用默认): ").strip()
+        if out:
+            out = clean_path(out)
+            # 纯文件名（无路径分隔符）→ 放到输入文件同目录下
+            if os.sep not in out and os.altsep not in out:
+                out = str(Path(args.input).parent / out)
         args.output = out if out else None
 
         if cmd == "info":
@@ -1299,6 +1395,25 @@ def interactive_mode():
                 args.gpu = True
             cmd_convert(args)
         elif cmd == "resize":
+            # 检测当前分辨率，智能建议缩放目标
+            try:
+                probe = json.loads(subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-print_format", "json",
+                     "-show_streams", "-select_streams", "v:0", args.input],
+                    capture_output=True, text=True,
+                ).stdout)
+                streams = probe.get("streams", [])
+                if streams:
+                    cw, ch = streams[0].get("width", 0), streams[0].get("height", 0)
+                    print(f"  当前分辨率: {cw}x{ch}")
+                    if ch >= 2160:
+                        print(f"  建议: 1080p / 720p")
+                    elif ch >= 1080:
+                        print(f"  建议: 720p / 480p")
+                    elif ch >= 720:
+                        print(f"  建议: 480p / 360p")
+            except Exception:
+                pass
             args.size = input("分辨率 (720p/1080p/4k 或 1280:720): ").strip()
             if input("使用 GPU 加速？(y/N): ").strip().lower() == "y":
                 args.gpu = True
